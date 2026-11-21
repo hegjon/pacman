@@ -97,6 +97,30 @@ static int btr_unhex32(const char *s, unsigned char out[32])
 /* Sync targets whose database entry carries btrpkg data come as NAME.pkg.btr cache files,
  * when a helper is configured and the cache directory is on btrfs (their data is shared with
  * the installed files by reflink). Everything else is downloaded as usual. */
+/* Where a package's repository keeps its btrparts, relative to the repository's URL: the
+ * database's btrpkg.parts (e.g. ../pkg, shared by the architecture directories), else
+ * pkg inside it. */
+static const char *btr_parts(alpm_pkg_t *pkg)
+{
+	const char *p = btr_xdata(pkg, "btrpkg.parts");
+	return p ? p : "pkg";
+}
+
+/* A btrpkg.parts value the helpers take: relative, no URL, no query, nothing but printable
+ * characters (btrpkg checks it again). */
+static int btr_parts_ok(const char *p)
+{
+	if(!*p || *p == '/' || strstr(p, "://")) {
+		return 0;
+	}
+	for(const char *c = p; *c; c++) {
+		if(*c <= ' ' || *c > '~' || strchr("\\?#%", *c)) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
 static void btr_select(alpm_handle_t *handle, const char *cachedir)
 {
 	struct statfs sf;
@@ -121,7 +145,8 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 		const char *name = index + 6;
 		size_t len = strlen(name);
 		if(len <= 7 || strcmp(name + len - 7, ".btridx") != 0 || name[0] == '.'
-				|| memchr(name, '/', len - 7) || btr_unhex32(id, spkg->btr_id) != 0) {
+				|| memchr(name, '/', len - 7) || btr_unhex32(id, spkg->btr_id) != 0
+				|| !btr_parts_ok(btr_parts(spkg))) {
 			_alpm_log(handle, ALPM_LOG_WARNING, _("%s: unusable btrpkg data in the database\n"), spkg->name);
 			continue;
 		}
@@ -412,19 +437,22 @@ static int btr_download_dir(alpm_handle_t *handle, const char *cachedir, char *d
 }
 
 /* fetch-ids arguments for one repository: `--index-only` when `want` is NULL, else
- * `--want WANT --progress`; then --server for every CacheServer and Server entry, in that order,
- * and DIR. NULL-terminated; free the array (not the strings). */
-static const char **btr_fetch_args(alpm_db_t *db, const char *dir, const char *want, int sandboxed)
+ * `--want WANT --progress`; the servers' btrparts directory (`--parts`); then --server for every
+ * CacheServer and Server entry, in that order, and DIR. NULL-terminated; free the array (not the
+ * strings). */
+static const char **btr_fetch_args(alpm_db_t *db, const char *parts, const char *dir, const char *want, int sandboxed)
 {
 	size_t nserv = alpm_list_count(db->cache_servers) + alpm_list_count(db->servers), k = 0;
 	if(nserv == 0) {
 		return NULL;
 	}
-	const char **ex = calloc(8 + 2 * nserv + 1, sizeof(char *));
+	const char **ex = calloc(10 + 2 * nserv + 1, sizeof(char *));
 	if(!ex) {
 		return NULL;
 	}
 	ex[k++] = "fetch-ids";
+	ex[k++] = "--parts";
+	ex[k++] = parts;
 	if(want) {
 		ex[k++] = "--want";
 		ex[k++] = want;
@@ -447,14 +475,15 @@ static const char **btr_fetch_args(alpm_db_t *db, const char *dir, const char *w
 	return ex;
 }
 
-/* Take the packages of the first package's repository out of *pkgs. */
+/* Take the packages of the first package's repository and btrparts directory out of *pkgs. */
 static alpm_list_t *btr_take_repo(alpm_list_t **pkgs)
 {
 	alpm_db_t *db = ((alpm_pkg_t *)(*pkgs)->data)->origin_data.db;
+	const char *parts = btr_parts((*pkgs)->data);
 	alpm_list_t *mine = NULL, *others = NULL;
 	for(alpm_list_t *i = *pkgs; i; i = i->next) {
 		alpm_pkg_t *p = i->data;
-		if(p->origin_data.db == db) {
+		if(p->origin_data.db == db && strcmp(btr_parts(p), parts) == 0) {
 			mine = alpm_list_add(mine, p);
 		} else {
 			others = alpm_list_add(others, p);
@@ -469,7 +498,7 @@ static alpm_list_t *btr_take_repo(alpm_list_t **pkgs)
 static int btr_fetch_indexes(alpm_handle_t *handle, alpm_list_t *mine, const char *dir, int sandboxed)
 {
 	alpm_db_t *db = ((alpm_pkg_t *)mine->data)->origin_data.db;
-	const char **ex = btr_fetch_args(db, dir, NULL, sandboxed);
+	const char **ex = btr_fetch_args(db, btr_parts(mine->data), dir, NULL, sandboxed);
 	char **argv = ex ? btr_argv(handle, ex, mine) : NULL;
 	int ret = argv ? btr_run(handle, argv, sandboxed, 0, mine) : -1;
 	if(ret != 0) {
@@ -618,7 +647,7 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 			for(int pass = 0; pass < 2 && !done; pass++) {
 				for(alpm_list_t *s = pass ? db->servers : db->cache_servers; s && !done; s = s->next) {
 					const char *pull[] = { "--installed", handle->root, "pull-ids", "--progress",
-						s->data, cachedir, NULL };
+						"--parts", btr_parts(mine->data), s->data, cachedir, NULL };
 					argv = btr_argv(handle, pull, mine);
 					if(argv && btr_run(handle, argv, 0, 1, mine) == 0) {
 						done = 1;
@@ -641,7 +670,7 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 			ret = -1;
 			goto next;
 		}
-		ex = btr_fetch_args(db, dir, missing, sandboxed);
+		ex = btr_fetch_args(db, btr_parts(mine->data), dir, missing, sandboxed);
 		fetch = ex ? btr_argv(handle, ex, mine) : NULL;
 		const char *pull[] = { "--installed", handle->root, "pull-ids", "--consume",
 			"--fetch-via", missing, dir, cachedir, NULL };
