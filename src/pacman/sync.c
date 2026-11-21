@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <fnmatch.h>
+#include <ftw.h>
 
 #include <alpm.h>
 #include <alpm_list.h>
@@ -155,6 +156,32 @@ static int sync_cleandb_all(void)
 	return ret;
 }
 
+/* nftw callback: remove one entry of a btrpkg download directory */
+static int rm_entry(const char *path, const struct stat *st, int type, struct FTW *ftw)
+{
+	(void)st; (void)ftw;
+	return (type == FTW_DP ? rmdir(path) : unlink(path)) == 0 ? 0 : -1;
+}
+
+/* Leftovers of an interrupted btrpkg download (libalpm keeps them so the next run can continue;
+ * -Sc removes them like pacman's own partial downloads). Returns 1 if `name` was one. */
+static int clean_btr_leftover(const char *cachedir, const char *name, int *ret)
+{
+	char path[PATH_MAX];
+	if(strcmp(name, "download-btrpkg") != 0 && strcmp(name, "download-btrpkg.want") != 0) {
+		return 0;
+	}
+	if(snprintf(path, PATH_MAX, "%s%s", cachedir, name) >= PATH_MAX) {
+		return 1;
+	}
+	/* FTW_PHYS: never follow symlinks (the directory belongs to the download user) */
+	if(nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) != 0) {
+		pm_printf(ALPM_LOG_ERROR, _("could not remove %s: %s\n"), path, strerror(errno));
+		(*ret)++;
+	}
+	return 1;
+}
+
 static int sync_cleancache(int level)
 {
 	alpm_list_t *i;
@@ -218,6 +245,9 @@ static int sync_cleancache(int level)
 			size_t len;
 
 			if(strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+				continue;
+			}
+			if(clean_btr_leftover(cachedir, ent->d_name, &ret)) {
 				continue;
 			}
 

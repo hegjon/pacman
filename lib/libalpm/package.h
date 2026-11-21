@@ -148,6 +148,8 @@ struct _alpm_pkg_t {
 	/* sync package downloaded as a btrpkg cache file (filename is NAME.pkg.btr) */
 	int btr;
 	unsigned char btr_id[32]; /* header ID from the database's btrpkg.id */
+	int btr_planned;          /* btr_need is known (pull-ids --plan) */
+	off_t btr_need;           /* bytes to download: missing chunks plus the index */
 };
 
 alpm_file_t *_alpm_file_copy(alpm_file_t *dest, const alpm_file_t *src);

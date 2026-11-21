@@ -57,7 +57,9 @@
 #include <sys/wait.h>
 #include "btrpkg.h"
 #include "btrstream.h"
+#include "sandbox.h"
 #include "util-common.h"
+#include <pwd.h>
 
 static const char *const btr_keydirs[] = { "/etc/btrpkg/keys", "/usr/share/btrpkg/keys", NULL };
 
@@ -136,9 +138,423 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 	}
 }
 
-/* Download the btrpkg targets among `files` (removing them from it): one helper run per
- * repository, so all its packages share one download queue and reuse data from the installed
- * versions. */
+/* The helper's argv: BtrPkgHelper split into words, then `extra` (NULL-terminated), then the
+ * NAME=ID arguments of `pkgs`. Free with btr_argv_free. */
+static char **btr_argv(alpm_handle_t *handle, const char *const *extra, alpm_list_t *pkgs)
+{
+	char **cmd = wordsplit(handle->btrpkg_helper);
+	size_t ncmd = 0, nextra = 0, k = 0;
+	if(!cmd) {
+		return NULL;
+	}
+	while(cmd[ncmd]) {
+		ncmd++;
+	}
+	while(extra[nextra]) {
+		nextra++;
+	}
+	char **argv = calloc(ncmd + nextra + alpm_list_count(pkgs) + 1, sizeof(char *));
+	if(!argv) {
+		wordsplit_free(cmd);
+		return NULL;
+	}
+	for(size_t j = 0; j < ncmd; j++) {
+		argv[k++] = cmd[j];
+	}
+	free(cmd); /* the words now belong to argv */
+	for(size_t j = 0; j < nextra; j++) {
+		argv[k++] = strdup(extra[j]);
+	}
+	for(alpm_list_t *i = pkgs; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		char hex[65];
+		size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
+		btr_hex(p->btr_id, 32, hex);
+		char *id = malloc(fl + 1 + 64 + 1);
+		if(id) {
+			memcpy(id, p->filename, fl);
+			id[fl] = '=';
+			memcpy(id + fl + 1, hex, 65);
+		}
+		argv[k++] = id;
+	}
+	for(size_t j = 0; j < k; j++) {
+		if(!argv[j]) {
+			for(size_t m = 0; m < k; m++) {
+				free(argv[m]);
+			}
+			free(argv);
+			return NULL;
+		}
+	}
+	return argv;
+}
+
+static void btr_argv_free(char **argv)
+{
+	for(size_t j = 0; argv && argv[j]; j++) {
+		free(argv[j]);
+	}
+	free(argv);
+}
+
+/* The package whose cache file is NAME.pkg.btr. */
+static alpm_pkg_t *btr_find(alpm_list_t *pkgs, const char *name, size_t len)
+{
+	for(alpm_list_t *i = pkgs; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		if(strlen(p->filename) == len + 8 && strncmp(p->filename, name, len) == 0) {
+			return p;
+		}
+	}
+	return NULL;
+}
+
+/* Run the helper and wait for it. `sandboxed`: as DownloadUser under pacman's seccomp filter and
+ * no-new-privileges (the helper applies Landlock itself: after Landlock it couldn't be started).
+ * `progress`: the helper's stdout carries fetch-ids progress lines, turned into download
+ * callbacks so the frontend draws its usual progress bars; otherwise stdout goes to /dev/null.
+ * Returns the exit status, or -1. */
+static int btr_run(alpm_handle_t *handle, char **argv, int sandboxed, int progress, alpm_list_t *pkgs)
+{
+	int pfd[2];
+	if(pipe2(pfd, O_CLOEXEC) != 0) {
+		return -1;
+	}
+	_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: running %s %s%s\n", argv[0], argv[1] ? argv[1] : "",
+			sandboxed ? " as the download user" : "");
+	pid_t pid = fork();
+	if(pid < 0) {
+		close(pfd[0]);
+		close(pfd[1]);
+		return -1;
+	}
+	if(pid == 0) {
+		_alpm_reset_signals();
+		if(progress) {
+			dup2(pfd[1], STDOUT_FILENO);
+		} else {
+			int null = open("/dev/null", O_WRONLY);
+			if(null >= 0) {
+				dup2(null, STDOUT_FILENO);
+			}
+		}
+		if(sandboxed && alpm_sandbox_setup_child(handle, handle->sandboxuser, NULL, true) != 0) {
+			fprintf(stderr, "btrpkg: switching to the download user '%s' failed\n", handle->sandboxuser);
+			_exit(126);
+		}
+		execvp(argv[0], argv);
+		fprintf(stderr, "btrpkg: cannot run %s: %s\n", argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(pfd[1]);
+	FILE *in = fdopen(pfd[0], "r");
+	char *line = NULL;
+	size_t cap = 0;
+	ssize_t n;
+	off_t *total = calloc(alpm_list_count(pkgs) + 1, sizeof(off_t));
+	while(in && (n = getline(&line, &cap, in)) > 0) {
+		if(!progress || !handle->dlcb || !total) {
+			continue;
+		}
+		if(line[n - 1] == '\n') {
+			line[--n] = '\0';
+		}
+		char *kind = line, *name = strchr(line, '\t'), *num = NULL;
+		if(!name) {
+			continue;
+		}
+		*name++ = '\0';
+		if((num = strchr(name, '\t'))) {
+			*num++ = '\0';
+		}
+		alpm_pkg_t *p = btr_find(pkgs, name, strlen(name));
+		if(!p) {
+			continue;
+		}
+		size_t k = 0;
+		for(alpm_list_t *i = pkgs; i && i->data != p; i = i->next) {
+			k++;
+		}
+		if(strcmp(kind, "total") == 0 && num) {
+			total[k] = (off_t)strtoll(num, NULL, 10);
+			if(total[k] > 0) {
+				alpm_download_event_init_t init = { .optional = 0 };
+				handle->dlcb(handle->dlcb_ctx, p->filename, ALPM_DOWNLOAD_INIT, &init);
+			}
+		} else if(strcmp(kind, "got") == 0 && num && total[k] > 0) {
+			alpm_download_event_progress_t pr = { .downloaded = (off_t)strtoll(num, NULL, 10), .total = total[k] };
+			handle->dlcb(handle->dlcb_ctx, p->filename, ALPM_DOWNLOAD_PROGRESS, &pr);
+		} else if(strcmp(kind, "done") == 0) {
+			/* nothing needed from the network: like a file that is up to date */
+			alpm_download_event_completed_t c = { .total = total[k], .result = total[k] > 0 ? 0 : 1 };
+			if(total[k] == 0) {
+				alpm_download_event_init_t init = { .optional = 0 };
+				handle->dlcb(handle->dlcb_ctx, p->filename, ALPM_DOWNLOAD_INIT, &init);
+			}
+			handle->dlcb(handle->dlcb_ctx, p->filename, ALPM_DOWNLOAD_COMPLETED, &c);
+		}
+	}
+	free(line);
+	free(total);
+	if(in) {
+		fclose(in);
+	} else {
+		close(pfd[0]);
+	}
+	int status;
+	while(waitpid(pid, &status, 0) < 0) {
+		if(errno != EINTR) {
+			return -1;
+		}
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Run pull-ids (root, no network) with a pipe each way. When it has reused everything it can
+ * from this machine, it lists the chunks still missing in `missing` and prints
+ * "fetch\tN\tBYTES"; then `fetch_argv` (fetch-ids --want) runs as the download user and fills the
+ * download directory, and pull-ids is told "go". Returns pull-ids' exit status, or -1. */
+static int btr_pull(alpm_handle_t *handle, char **pull_argv, char **fetch_argv, int sandboxed,
+		alpm_list_t *pkgs)
+{
+	int out[2], in[2];
+	if(pipe2(out, O_CLOEXEC) != 0) {
+		return -1;
+	}
+	if(pipe2(in, O_CLOEXEC) != 0) {
+		close(out[0]);
+		close(out[1]);
+		return -1;
+	}
+	_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: running %s pull-ids\n", pull_argv[0]);
+	pid_t pid = fork();
+	if(pid < 0) {
+		close(out[0]); close(out[1]); close(in[0]); close(in[1]);
+		return -1;
+	}
+	if(pid == 0) {
+		_alpm_reset_signals();
+		dup2(out[1], STDOUT_FILENO);
+		dup2(in[0], STDIN_FILENO);
+		execvp(pull_argv[0], pull_argv);
+		fprintf(stderr, "btrpkg: cannot run %s: %s\n", pull_argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(out[1]);
+	close(in[0]);
+	FILE *rd = fdopen(out[0], "r");
+	char *line = NULL;
+	size_t cap = 0;
+	while(rd && getline(&line, &cap, rd) > 0) {
+		if(strncmp(line, "fetch\t", 6) != 0) {
+			continue;
+		}
+		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s", line);
+		int rc = btr_run(handle, fetch_argv, sandboxed, 1, pkgs);
+		if(rc == 0) {
+			if(write(in[1], "go\n", 3) != 3) {
+				break;
+			}
+		} else {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg packages\n"));
+			break; /* closing stdin makes pull-ids fail */
+		}
+	}
+	free(line);
+	close(in[1]);
+	if(rd) {
+		fclose(rd);
+	} else {
+		close(out[0]);
+	}
+	int status;
+	while(waitpid(pid, &status, 0) < 0) {
+		if(errno != EINTR) {
+			return -1;
+		}
+	}
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* CACHEDIR/download-btrpkg: created if needed, a real directory, and owned by the download user
+ * when downloads are sandboxed. */
+static int btr_download_dir(alpm_handle_t *handle, const char *cachedir, char *dir, size_t len,
+		int sandboxed)
+{
+	struct stat st;
+	snprintf(dir, len, "%sdownload-btrpkg", cachedir);
+	if(mkdir(dir, 0755) != 0 && errno != EEXIST) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: cannot create %s: %s\n"), dir, strerror(errno));
+		return -1;
+	}
+	if(lstat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: %s is not a directory\n"), dir);
+		return -1;
+	}
+	if(sandboxed) {
+		struct passwd const *pw = getpwnam(handle->sandboxuser);
+		if(!pw || chown(dir, pw->pw_uid, pw->pw_gid) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: cannot hand %s to the download user\n"), dir);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* fetch-ids arguments for one repository: `--index-only` when `want` is NULL, else
+ * `--want WANT --progress`; then --server for every CacheServer and Server entry, in that order,
+ * and DIR. NULL-terminated; free the array (not the strings). */
+static const char **btr_fetch_args(alpm_db_t *db, const char *dir, const char *want, int sandboxed)
+{
+	size_t nserv = alpm_list_count(db->cache_servers) + alpm_list_count(db->servers), k = 0;
+	if(nserv == 0) {
+		return NULL;
+	}
+	const char **ex = calloc(8 + 2 * nserv + 1, sizeof(char *));
+	if(!ex) {
+		return NULL;
+	}
+	ex[k++] = "fetch-ids";
+	if(want) {
+		ex[k++] = "--want";
+		ex[k++] = want;
+		ex[k++] = "--progress";
+	} else {
+		ex[k++] = "--index-only";
+	}
+	if(sandboxed) {
+		ex[k++] = "--landlock";
+	}
+	for(alpm_list_t *s = db->cache_servers; s; s = s->next) {
+		ex[k++] = "--server";
+		ex[k++] = s->data;
+	}
+	for(alpm_list_t *s = db->servers; s; s = s->next) {
+		ex[k++] = "--server";
+		ex[k++] = s->data;
+	}
+	ex[k++] = dir;
+	return ex;
+}
+
+/* Take the packages of the first package's repository out of *pkgs. */
+static alpm_list_t *btr_take_repo(alpm_list_t **pkgs)
+{
+	alpm_db_t *db = ((alpm_pkg_t *)(*pkgs)->data)->origin_data.db;
+	alpm_list_t *mine = NULL, *others = NULL;
+	for(alpm_list_t *i = *pkgs; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		if(p->origin_data.db == db) {
+			mine = alpm_list_add(mine, p);
+		} else {
+			others = alpm_list_add(others, p);
+		}
+	}
+	alpm_list_free(*pkgs);
+	*pkgs = others;
+	return mine;
+}
+
+/* Get the indexes of `mine` (one repository) into DIR, as the download user when sandboxed. */
+static int btr_fetch_indexes(alpm_handle_t *handle, alpm_list_t *mine, const char *dir, int sandboxed)
+{
+	alpm_db_t *db = ((alpm_pkg_t *)mine->data)->origin_data.db;
+	const char **ex = btr_fetch_args(db, dir, NULL, sandboxed);
+	char **argv = ex ? btr_argv(handle, ex, mine) : NULL;
+	int ret = argv ? btr_run(handle, argv, sandboxed, 0, mine) : -1;
+	if(ret != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg indexes from %s\n"), db->treename);
+	}
+	btr_argv_free(argv);
+	free(ex);
+	return ret == 0 ? 0 : -1;
+}
+
+/* Before the transaction summary: the real download size of every btrpkg target without a cache
+ * file. The indexes are fetched (and kept for the download), then pull-ids --plan checks which
+ * chunks this machine has, writing nothing. Targets it can't plan keep the upper bound. */
+static void btr_plan(alpm_handle_t *handle, const char *cachedir, alpm_list_t *targets)
+{
+	alpm_list_t *btr = NULL;
+	char dir[PATH_MAX];
+	int sandboxed = _alpm_use_sandbox(handle);
+	for(alpm_list_t *i = targets; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		char *fpath;
+		if(!p->btr || p->origin != ALPM_PKG_FROM_SYNCDB) {
+			continue;
+		}
+		if((fpath = _alpm_filecache_find(handle, p->filename))) {
+			free(fpath);
+			continue;
+		}
+		btr = alpm_list_add(btr, p);
+	}
+	if(!btr || btr_download_dir(handle, cachedir, dir, sizeof(dir), sandboxed) != 0) {
+		alpm_list_free(btr);
+		return;
+	}
+	while(btr) {
+		alpm_list_t *mine = btr_take_repo(&btr);
+		if(btr_fetch_indexes(handle, mine, dir, sandboxed) == 0) {
+			const char *plan[] = { "--installed", handle->root, "pull-ids", "--plan", dir, cachedir, NULL };
+			char **argv = btr_argv(handle, plan, mine);
+			int out[2];
+			if(argv && pipe2(out, O_CLOEXEC) == 0) {
+				pid_t pid = fork();
+				if(pid == 0) {
+					_alpm_reset_signals();
+					dup2(out[1], STDOUT_FILENO);
+					execvp(argv[0], argv);
+					_exit(127);
+				}
+				close(out[1]);
+				FILE *rd = fdopen(out[0], "r");
+				char *line = NULL;
+				size_t cap = 0;
+				while(rd && getline(&line, &cap, rd) > 0) {
+					char name[PATH_MAX];
+					long long cb, ib;
+					if(sscanf(line, "need\t%4095[^\t]\t%lld\t%lld", name, &cb, &ib) == 3) {
+						alpm_pkg_t *p = btr_find(mine, name, strlen(name));
+						if(p) {
+							p->btr_need = (off_t)(cb + ib);
+							p->btr_planned = 1;
+						}
+					}
+				}
+				free(line);
+				if(rd) {
+					fclose(rd);
+				} else {
+					close(out[0]);
+				}
+				if(pid > 0) {
+					int status;
+					while(waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+					}
+				}
+			}
+			btr_argv_free(argv);
+		}
+		alpm_list_free(mine);
+	}
+}
+
+/* Download the btrpkg targets among `files` (removing them from it), per repository:
+ *   1. fetch-ids --index-only, as the download user when pacman sandboxes downloads (also under
+ *      Landlock: it writes only to CACHEDIR/download-btrpkg/): the indexes and signatures.
+ *      Usually already there from btr_plan, and then nothing is fetched.
+ *   2. pull-ids (root, no network) checks the indexes against the database's IDs, takes every
+ *      chunk it can from the installed versions and older cache files (each read back and
+ *      hashed), then names the chunks still missing.
+ *   3. fetch-ids --want (download user again) gets exactly those, from the CacheServer entries
+ *      first, then Server entries, each server asked for what the previous one lacked. Chunks
+ *      are checked against their hashes on arrival, and again by pull-ids when it reads them.
+ *   4. pull-ids writes NAME.pkg.btr with encoded writes and removes the download directory.
+ * Root never writes into the download directory and never touches the network. After a failure
+ * the directory stays, so the next run fetches only what is still missing. */
 static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t **files)
 {
 	alpm_list_t *btr = NULL, *rest = NULL;
@@ -153,92 +569,46 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 	}
 	alpm_list_free(*files);
 	*files = rest;
+	if(!btr) {
+		return 0;
+	}
+
+	int sandboxed = _alpm_use_sandbox(handle);
+	char dir[PATH_MAX], missing[PATH_MAX];
+	/* root writes the list of missing chunks: not in the download user's directory */
+	snprintf(missing, sizeof(missing), "%sdownload-btrpkg.want", cachedir);
+	if(btr_download_dir(handle, cachedir, dir, sizeof(dir), sandboxed) != 0) {
+		alpm_list_free(btr);
+		return -1;
+	}
 
 	while(btr && ret == 0) {
-		alpm_db_t *db = ((alpm_pkg_t *)btr->data)->origin_data.db;
-		alpm_list_t *mine = NULL, *others = NULL;
-		for(alpm_list_t *i = btr; i; i = i->next) {
-			alpm_pkg_t *p = i->data;
-			if(p->origin_data.db == db) {
-				mine = alpm_list_add(mine, p);
-			} else {
-				others = alpm_list_add(others, p);
-			}
-		}
-		alpm_list_free(btr);
-		btr = others;
-
-		char **cmd = wordsplit(handle->btrpkg_helper);
-		size_t ncmd = 0, n = alpm_list_count(mine), k = 0;
-		const char *server = db->servers ? db->servers->data : NULL;
-		char **argv = NULL;
-		char **ids = calloc(n, sizeof(char *));
-		if(!cmd || !server || !ids) {
-			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: cannot run '%s' for %s\n"), handle->btrpkg_helper, db->treename);
+		alpm_list_t *mine = btr_take_repo(&btr);
+		alpm_db_t *db = ((alpm_pkg_t *)mine->data)->origin_data.db;
+		const char **ex = NULL;
+		char **argv = NULL, **fetch = NULL;
+		if(btr_fetch_indexes(handle, mine, dir, sandboxed) != 0) {
 			ret = -1;
 			goto next;
 		}
-		while(cmd[ncmd]) {
-			ncmd++;
-		}
-		argv = calloc(ncmd + 6 + n + 1, sizeof(char *));
-		if(!argv) {
+		ex = btr_fetch_args(db, dir, missing, sandboxed);
+		fetch = ex ? btr_argv(handle, ex, mine) : NULL;
+		const char *pull[] = { "--installed", handle->root, "pull-ids", "--consume",
+			"--fetch-via", missing, dir, cachedir, NULL };
+		argv = btr_argv(handle, pull, mine);
+		if(!fetch || !argv) {
 			ret = -1;
 			goto next;
 		}
-		for(size_t j = 0; j < ncmd; j++) {
-			argv[k++] = cmd[j];
-		}
-		argv[k++] = (char *)"pull-ids";
-		argv[k++] = (char *)"--installed";
-		argv[k++] = handle->root;
-		argv[k++] = (char *)server;
-		argv[k++] = (char *)cachedir;
-		size_t m = 0;
-		for(alpm_list_t *i = mine; i; i = i->next, m++) {
-			alpm_pkg_t *p = i->data;
-			char hex[65];
-			size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
-			btr_hex(p->btr_id, 32, hex);
-			ids[m] = malloc(fl + 1 + 64 + 1);
-			if(!ids[m]) {
-				ret = -1;
-				goto next;
-			}
-			memcpy(ids[m], p->filename, fl);
-			ids[m][fl] = '=';
-			memcpy(ids[m] + fl + 1, hex, 65);
-			argv[k++] = ids[m];
-		}
-		argv[k] = NULL;
-		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: running %s pull-ids for %zu packages from %s\n", argv[0], n, server);
-		pid_t pid = fork();
-		if(pid < 0) {
-			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: fork failed: %s\n"), strerror(errno));
-			ret = -1;
-			goto next;
-		}
-		if(pid == 0) {
-			execvp(argv[0], argv);
-			fprintf(stderr, "btrpkg: cannot run %s: %s\n", argv[0], strerror(errno));
-			_exit(127);
-		}
-		int status;
-		while(waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-		}
-		if(!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-			_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg packages from %s\n"), db->treename);
+		if(btr_pull(handle, argv, fetch, sandboxed, mine) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: could not assemble the packages from %s\n"), db->treename);
 			ret = -1;
 		}
 next:
-		if(ids) {
-			for(size_t j = 0; j < n; j++) {
-				free(ids[j]);
-			}
-		}
-		free(ids);
-		free(argv);
-		wordsplit_free(cmd);
+		unlink(missing);
+		btr_argv_free(argv);
+		btr_argv_free(fetch);
+		free(ex);
 		alpm_list_free(mine);
 	}
 	alpm_list_free(btr);
@@ -584,6 +954,19 @@ static int compute_download_size(alpm_pkg_t *newpkg)
 		size = 0;
 		goto finish;
 	}
+#ifdef HAVE_BTRPKG
+	if(newpkg->btr) {
+		/* what pull-ids --plan found missing after checking local data (btr_plan); without a
+		 * plan, the transport size (index and every chunk) as an upper bound */
+		if(newpkg->btr_planned) {
+			size = newpkg->btr_need;
+		} else {
+			const char *bs = btr_xdata(newpkg, "btrpkg.size");
+			size = bs ? (off_t)strtoll(bs, NULL, 10) : newpkg->size;
+		}
+		goto finish;
+	}
+#endif
 
 	fnamepartlen = strlen(fname) + 6;
 	CALLOC(fnamepart, fnamepartlen, sizeof(char), return -1);
@@ -921,6 +1304,12 @@ int _alpm_sync_prepare(alpm_handle_t *handle, alpm_list_t **data)
 			goto cleanup;
 		}
 	}
+#ifdef HAVE_BTRPKG
+	/* decide now which targets come as btrpkg cache files, so their download size and cache
+	 * file names are right in what the frontend shows before the transaction */
+	btr_select(handle, _alpm_filecache_setup(handle));
+	btr_plan(handle, _alpm_filecache_setup(handle), trans->add);
+#endif
 	for(i = trans->add; i; i = i->next) {
 		/* update download size field */
 		alpm_pkg_t *spkg = i->data;
@@ -1045,13 +1434,6 @@ static int download_files(alpm_handle_t *handle)
 		goto finish;
 	}
 
-#ifdef HAVE_BTRPKG
-	ret = btr_download(handle, cachedir, &files);
-	if(ret != 0) {
-		goto finish;
-	}
-#endif
-
 	if(files) {
 		/* check for necessary disk space for download */
 		if(handle->checkspace) {
@@ -1088,6 +1470,15 @@ static int download_files(alpm_handle_t *handle)
 		}
 
 		EVENT(handle, &event);
+#ifdef HAVE_BTRPKG
+		/* btrpkg packages first (they are in the totals above); the rest as usual */
+		ret = btr_download(handle, cachedir, &files);
+		if(ret != 0) {
+			event.type = ALPM_EVENT_PKG_RETRIEVE_FAILED;
+			EVENT(handle, &event);
+			goto finish;
+		}
+#endif
 		for(i = files; i; i = i->next) {
 			alpm_pkg_t *pkg = i->data;
 			int siglevel = alpm_db_get_siglevel(alpm_pkg_get_db(pkg));
@@ -1116,7 +1507,7 @@ static int download_files(alpm_handle_t *handle)
 			payloads = alpm_list_add(payloads, payload);
 		}
 
-		ret = _alpm_download(handle, payloads, cachedir, temporary_cachedir);
+		ret = payloads ? _alpm_download(handle, payloads, cachedir, temporary_cachedir) : 0;
 		if(ret == -1) {
 			event.type = ALPM_EVENT_PKG_RETRIEVE_FAILED;
 			EVENT(handle, &event);
@@ -1521,6 +1912,7 @@ int _alpm_sync_load(alpm_handle_t *handle, alpm_list_t **data)
 
 #ifdef HAVE_BTRPKG
 	btr_select(handle, _alpm_filecache_setup(handle));
+	btr_plan(handle, _alpm_filecache_setup(handle), trans->add);
 #endif
 	if(download_files(handle) == -1) {
 		return -1;
