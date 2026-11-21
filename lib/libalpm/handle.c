@@ -103,6 +103,7 @@ void _alpm_handle_free(alpm_handle_t *handle)
 	FREELIST(handle->architectures);
 	FREE(handle->gpgdir);
 	FREE(handle->sandboxuser);
+	FREE(handle->btrpkg_helper);
 	FREELIST(handle->noupgrade);
 	FREELIST(handle->noextract);
 	FREELIST(handle->ignorepkg);
@@ -292,6 +293,23 @@ const char SYMEXPORT *alpm_option_get_gpgdir(alpm_handle_t *handle)
 {
 	CHECK_HANDLE(handle, return NULL);
 	return handle->gpgdir;
+}
+
+const char SYMEXPORT *alpm_option_get_btrpkg_helper(alpm_handle_t *handle)
+{
+	CHECK_HANDLE(handle, return NULL);
+	return handle->btrpkg_helper;
+}
+
+int SYMEXPORT alpm_option_set_btrpkg_helper(alpm_handle_t *handle, const char *cmd)
+{
+	CHECK_HANDLE(handle, return -1);
+	FREE(handle->btrpkg_helper);
+	if(cmd) {
+		STRDUP(handle->btrpkg_helper, cmd, RET_ERR(handle, ALPM_ERR_MEMORY, -1));
+	}
+	_alpm_log(handle, ALPM_LOG_DEBUG, "option 'btrpkg_helper' = %s\n", cmd ? cmd : "(none)");
+	return 0;
 }
 
 const char SYMEXPORT *alpm_option_get_sandboxuser(alpm_handle_t *handle)

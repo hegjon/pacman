@@ -48,6 +48,259 @@
 #include "diskspace.h"
 #include "signing.h"
 
+#ifdef HAVE_BTRPKG
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/magic.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
+#include <sys/wait.h>
+#include "btrpkg.h"
+#include "btrstream.h"
+#include "util-common.h"
+
+static const char *const btr_keydirs[] = { "/etc/btrpkg/keys", "/usr/share/btrpkg/keys", NULL };
+
+static const char *btr_xdata(alpm_pkg_t *pkg, const char *name)
+{
+	for(alpm_list_t *i = pkg->xdata; i; i = i->next) {
+		alpm_pkg_xdata_t *x = i->data;
+		if(strcmp(x->name, name) == 0) {
+			return x->value;
+		}
+	}
+	return NULL;
+}
+
+static int btr_unhex32(const char *s, unsigned char out[32])
+{
+	if(strlen(s) != 64) {
+		return -1;
+	}
+	for(int i = 0; i < 64; i++) {
+		char c = s[i];
+		int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+		if(v < 0) {
+			return -1;
+		}
+		if(i % 2 == 0) {
+			out[i / 2] = (unsigned char)(v << 4);
+		} else {
+			out[i / 2] |= (unsigned char)v;
+		}
+	}
+	return 0;
+}
+
+/* Sync targets whose database entry carries btrpkg data come as NAME.pkg.btr cache files,
+ * when a helper is configured and the cache directory is on btrfs (their data is shared with
+ * the installed files by reflink). Everything else is downloaded as usual. */
+static void btr_select(alpm_handle_t *handle, const char *cachedir)
+{
+	struct statfs sf;
+	if(!handle->btrpkg_helper || !cachedir) {
+		return;
+	}
+	if(statfs(cachedir, &sf) != 0 || sf.f_type != BTRFS_SUPER_MAGIC) {
+		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s is not on btrfs, not using btrpkg packages\n", cachedir);
+		return;
+	}
+	for(alpm_list_t *i = handle->trans->add; i; i = i->next) {
+		alpm_pkg_t *spkg = i->data;
+		const char *index, *id;
+		if(spkg->origin == ALPM_PKG_FROM_FILE || spkg->btr) {
+			continue;
+		}
+		index = btr_xdata(spkg, "btrpkg.index");
+		id = btr_xdata(spkg, "btrpkg.id");
+		if(!index || !id || strncmp(index, "index/", 6) != 0) {
+			continue;
+		}
+		const char *name = index + 6;
+		size_t len = strlen(name);
+		if(len <= 7 || strcmp(name + len - 7, ".btridx") != 0 || name[0] == '.'
+				|| memchr(name, '/', len - 7) || btr_unhex32(id, spkg->btr_id) != 0) {
+			_alpm_log(handle, ALPM_LOG_WARNING, _("%s: unusable btrpkg data in the database\n"), spkg->name);
+			continue;
+		}
+		char *fn = malloc(len - 7 + 9);
+		if(!fn) {
+			continue;
+		}
+		memcpy(fn, name, len - 7);
+		strcpy(fn + len - 7, ".pkg.btr");
+		FREE(spkg->filename);
+		spkg->filename = fn;
+		spkg->btr = 1;
+		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s comes as %s\n", spkg->name, fn);
+	}
+}
+
+/* Download the btrpkg targets among `files` (removing them from it): one helper run per
+ * repository, so all its packages share one download queue and reuse data from the installed
+ * versions. */
+static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t **files)
+{
+	alpm_list_t *btr = NULL, *rest = NULL;
+	int ret = 0;
+	for(alpm_list_t *i = *files; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		if(p->btr) {
+			btr = alpm_list_add(btr, p);
+		} else {
+			rest = alpm_list_add(rest, p);
+		}
+	}
+	alpm_list_free(*files);
+	*files = rest;
+
+	while(btr && ret == 0) {
+		alpm_db_t *db = ((alpm_pkg_t *)btr->data)->origin_data.db;
+		alpm_list_t *mine = NULL, *others = NULL;
+		for(alpm_list_t *i = btr; i; i = i->next) {
+			alpm_pkg_t *p = i->data;
+			if(p->origin_data.db == db) {
+				mine = alpm_list_add(mine, p);
+			} else {
+				others = alpm_list_add(others, p);
+			}
+		}
+		alpm_list_free(btr);
+		btr = others;
+
+		char **cmd = wordsplit(handle->btrpkg_helper);
+		size_t ncmd = 0, n = alpm_list_count(mine), k = 0;
+		const char *server = db->servers ? db->servers->data : NULL;
+		char **argv = NULL;
+		char **ids = calloc(n, sizeof(char *));
+		if(!cmd || !server || !ids) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: cannot run '%s' for %s\n"), handle->btrpkg_helper, db->treename);
+			ret = -1;
+			goto next;
+		}
+		while(cmd[ncmd]) {
+			ncmd++;
+		}
+		argv = calloc(ncmd + 6 + n + 1, sizeof(char *));
+		if(!argv) {
+			ret = -1;
+			goto next;
+		}
+		for(size_t j = 0; j < ncmd; j++) {
+			argv[k++] = cmd[j];
+		}
+		argv[k++] = (char *)"pull-ids";
+		argv[k++] = (char *)"--installed";
+		argv[k++] = handle->root;
+		argv[k++] = (char *)server;
+		argv[k++] = (char *)cachedir;
+		size_t m = 0;
+		for(alpm_list_t *i = mine; i; i = i->next, m++) {
+			alpm_pkg_t *p = i->data;
+			char hex[65];
+			size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
+			btr_hex(p->btr_id, 32, hex);
+			ids[m] = malloc(fl + 1 + 64 + 1);
+			if(!ids[m]) {
+				ret = -1;
+				goto next;
+			}
+			memcpy(ids[m], p->filename, fl);
+			ids[m][fl] = '=';
+			memcpy(ids[m] + fl + 1, hex, 65);
+			argv[k++] = ids[m];
+		}
+		argv[k] = NULL;
+		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: running %s pull-ids for %zu packages from %s\n", argv[0], n, server);
+		pid_t pid = fork();
+		if(pid < 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: fork failed: %s\n"), strerror(errno));
+			ret = -1;
+			goto next;
+		}
+		if(pid == 0) {
+			execvp(argv[0], argv);
+			fprintf(stderr, "btrpkg: cannot run %s: %s\n", argv[0], strerror(errno));
+			_exit(127);
+		}
+		int status;
+		while(waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+		}
+		if(!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg packages from %s\n"), db->treename);
+			ret = -1;
+		}
+next:
+		if(ids) {
+			for(size_t j = 0; j < n; j++) {
+				free(ids[j]);
+			}
+		}
+		free(ids);
+		free(argv);
+		wordsplit_free(cmd);
+		alpm_list_free(mine);
+	}
+	alpm_list_free(btr);
+	return ret;
+}
+
+/* The check of a btrpkg cache file that replaces the sha256sum and OpenPGP checks: the index
+ * must parse and have the header ID the database gives, and with package signatures on, a
+ * signify signature (NAME.pkg.btr.sig, from the server) by a key in btr_keydirs. */
+static int btr_validate(alpm_handle_t *handle, alpm_pkg_t *pkg, const char *path, int siglevel,
+		int *validation)
+{
+	char err[BTR_ERRLEN];
+	struct stat st;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if(fd < 0 || fstat(fd, &st) != 0) {
+		if(fd >= 0) {
+			close(fd);
+		}
+		handle->pm_errno = ALPM_ERR_PKG_OPEN;
+		return -1;
+	}
+	if(_alpm_btr_validate(fd, pkg->btr_id, (uint64_t)st.st_size, err) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("%s: %s\n"), pkg->name, err);
+		close(fd);
+		handle->pm_errno = ALPM_ERR_PKG_INVALID_CHECKSUM;
+		return -1;
+	}
+	*validation = ALPM_PKG_VALIDATION_SHA256SUM;
+	if(siglevel & ALPM_SIG_PACKAGE) {
+		char sigpath[PATH_MAX], sig[4096], keypath[PATH_MAX];
+		unsigned char hdr[BTR_HDR];
+		ssize_t sl = -1;
+		snprintf(sigpath, sizeof(sigpath), "%s.sig", path);
+		int sfd = open(sigpath, O_RDONLY | O_CLOEXEC);
+		if(sfd >= 0) {
+			sl = read(sfd, sig, sizeof(sig));
+			close(sfd);
+		}
+		if(sl <= 0) {
+			close(fd);
+			if(siglevel & ALPM_SIG_PACKAGE_OPTIONAL) {
+				return 0;
+			}
+			handle->pm_errno = ALPM_ERR_PKG_MISSING_SIG;
+			return -1;
+		}
+		if(pread(fd, hdr, BTR_HDR, 0) != BTR_HDR
+				|| btr_sig_verify(hdr, sig, (size_t)sl, btr_keydirs, keypath, err) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("%s: btrpkg signature: %s\n"), pkg->name, err);
+			close(fd);
+			handle->pm_errno = ALPM_ERR_PKG_INVALID_CHECKSUM;
+			return -1;
+		}
+		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s signed by %s\n", pkg->name, keypath);
+		*validation |= ALPM_PKG_VALIDATION_SIGNATURE;
+	}
+	close(fd);
+	return 0;
+}
+#endif /* HAVE_BTRPKG */
+
 struct keyinfo_t {
        char* uid;
        char* keyid;
@@ -792,6 +1045,13 @@ static int download_files(alpm_handle_t *handle)
 		goto finish;
 	}
 
+#ifdef HAVE_BTRPKG
+	ret = btr_download(handle, cachedir, &files);
+	if(ret != 0) {
+		goto finish;
+	}
+#endif
+
 	if(files) {
 		/* check for necessary disk space for download */
 		if(handle->checkspace) {
@@ -919,6 +1179,9 @@ static int check_keyring(alpm_handle_t *handle)
 		if(pkg->origin == ALPM_PKG_FROM_FILE) {
 			continue; /* pkg_load() has been already called, this package is valid */
 		}
+		if(pkg->btr) {
+			continue; /* signify signature, checked in check_validity */
+		}
 
 		level = alpm_db_get_siglevel(alpm_pkg_get_db(pkg));
 		if((level & ALPM_SIG_PACKAGE)) {
@@ -1024,8 +1287,15 @@ static int check_validity(alpm_handle_t *handle,
 
 		v.siglevel = alpm_db_get_siglevel(alpm_pkg_get_db(v.pkg));
 
-		if(_alpm_pkg_validate_internal(handle, v.path, v.pkg,
-					v.siglevel, &v.siglist, &v.validation) == -1) {
+		int invalid_pkg;
+#ifdef HAVE_BTRPKG
+		if(v.pkg->btr) {
+			invalid_pkg = btr_validate(handle, v.pkg, v.path, v.siglevel, &v.validation) == -1;
+		} else
+#endif
+		invalid_pkg = _alpm_pkg_validate_internal(handle, v.path, v.pkg,
+					v.siglevel, &v.siglist, &v.validation) == -1;
+		if(invalid_pkg) {
 			struct validity *invalid;
 			v.error = handle->pm_errno;
 			MALLOC(invalid, sizeof(struct validity), return -1);
@@ -1249,6 +1519,9 @@ int _alpm_sync_load(alpm_handle_t *handle, alpm_list_t **data)
 	uint64_t total_bytes = 0;
 	alpm_trans_t *trans = handle->trans;
 
+#ifdef HAVE_BTRPKG
+	btr_select(handle, _alpm_filecache_setup(handle));
+#endif
 	if(download_files(handle) == -1) {
 		return -1;
 	}

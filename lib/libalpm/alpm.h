@@ -1884,6 +1884,18 @@ const char *alpm_option_get_sandboxuser(alpm_handle_t *handle);
 int alpm_option_set_sandboxuser(alpm_handle_t *handle, const char *sandboxuser);
 
 /* End of sandboxuser accessors */
+
+/** @name Accessors for the btrpkg helper
+ * The command libalpm runs to download packages whose sync database entry carries btrpkg data
+ * (`btrpkg.index`, `btrpkg.id` in %DATA%), split into words like XferCommand; libalpm appends
+ * `pull-ids --installed ROOT SERVER CACHEDIR NAME=ID...`. NULL (the default) downloads every
+ * package as usual. btrpkg packages are only used when the cache directory is on btrfs.
+ * @{
+ */
+const char *alpm_option_get_btrpkg_helper(alpm_handle_t *handle);
+int alpm_option_set_btrpkg_helper(alpm_handle_t *handle, const char *cmd);
+/* End of btrpkg helper accessors */
+/** @} */
 /** @} */
 
 

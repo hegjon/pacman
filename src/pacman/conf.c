@@ -156,6 +156,7 @@ int config_free(config_t *oldconfig)
 	free(oldconfig->logfile);
 	free(oldconfig->gpgdir);
 	free(oldconfig->sandboxuser);
+	free(oldconfig->btrpkghelper);
 	FREELIST(oldconfig->hookdirs);
 	FREELIST(oldconfig->cachedirs);
 	free(oldconfig->xfercommand);
@@ -722,6 +723,11 @@ static int _parse_options(const char *key, char *value,
 				config->sandboxuser = strdup(value);
 				pm_printf(ALPM_LOG_DEBUG, "config: sandboxuser: %s\n", value);
 			}
+		} else if(strcmp(key, "BtrPkgHelper") == 0) {
+			if(!config->btrpkghelper) {
+				config->btrpkghelper = strdup(value);
+				pm_printf(ALPM_LOG_DEBUG, "config: btrpkghelper: %s\n", value);
+			}
 		} else if(strcmp(key, "XferCommand") == 0) {
 			char **c;
 			if((config->xfercommand_argv = wordsplit(value)) == NULL) {
@@ -974,6 +980,8 @@ static int setup_libalpm(void)
 	alpm_option_set_architectures(handle, config->architectures);
 	alpm_option_set_checkspace(handle, config->checkspace);
 	alpm_option_set_usesyslog(handle, config->usesyslog);
+
+	alpm_option_set_btrpkg_helper(handle, config->btrpkghelper);
 
 	if((ret = alpm_option_set_sandboxuser(handle, config->sandboxuser)) != 0) {
 		pm_printf(ALPM_LOG_ERROR, _("problem setting DownloadUser '%s' (user does not exist)\n"),

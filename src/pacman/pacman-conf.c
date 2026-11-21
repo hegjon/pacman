@@ -272,6 +272,7 @@ static void dump_config(void)
 
 	show_list_str("Architecture", config->architectures);
 	show_str("XferCommand", config->xfercommand);
+	show_str("BtrPkgHelper", config->btrpkghelper);
 
 	show_bool("UseSyslog", config->usesyslog);
 	show_bool("Color", config->color);
@@ -384,6 +385,8 @@ static int list_directives(void)
 			show_list_str("Architecture", config->architectures);
 		} else if(strcasecmp(i->data, "XferCommand") == 0) {
 			show_str("XferCommand", config->xfercommand);
+		} else if(strcasecmp(i->data, "BtrPkgHelper") == 0) {
+			show_str("BtrPkgHelper", config->btrpkghelper);
 
 		} else if(strcasecmp(i->data, "UseSyslog") == 0) {
 			show_bool("UseSyslog", config->usesyslog);

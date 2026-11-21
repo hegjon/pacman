@@ -35,5 +35,5 @@ libalpm_sources = files('''
 '''.split())
 
 if have_btrpkg
-  libalpm_sources += files('btrpkg.h', 'btrpkg.c')
+  libalpm_sources += files('btrpkg.h', 'btrpkg.c', 'btrstream.h', 'btrstream.c')
 endif

@@ -47,6 +47,144 @@
 #include "remove.h"
 #include "handle.h"
 
+#ifdef HAVE_BTRPKG
+#include <linux/fs.h>
+#include <linux/openat2.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/xattr.h>
+#include "btrstream.h"
+
+/* Place a large file of a btrpkg package: a new file next to the target shares its extents
+ * with the cache file (FICLONERANGE; a copy where that fails), gets owner, mode, xattrs and
+ * mtime (in that order: writing data would drop security.capability, chown would drop setuid),
+ * and is renamed over the target, as ARCHIVE_EXTRACT_UNLINK would replace it. Parent
+ * directories are opened without following symlinks (ARCHIVE_EXTRACT_SECURE_SYMLINKS).
+ * Returns 0 on success, 1 on error (logged), -2 to leave the entry to libarchive. */
+static int btr_extract(alpm_handle_t *handle, struct archive_entry *entry, const char *filename,
+		int srcfd, uint64_t off, uint64_t size)
+{
+	size_t rl = strlen(handle->root);
+	if(strncmp(filename, handle->root, rl) != 0 || rl == 0 || handle->root[rl - 1] != '/') {
+		return -2;
+	}
+	const char *rel = filename + rl;
+	const char *slash = strrchr(rel, '/');
+	const char *base = slash ? slash + 1 : rel;
+	char dir[PATH_MAX], tmp[NAME_MAX + 1];
+	int rootfd = -1, dirfd = -1, fd = -1, ret = 1;
+	static unsigned counter;
+
+	if(slash) {
+		size_t dl = (size_t)(slash - rel);
+		if(dl >= sizeof(dir)) {
+			return -2;
+		}
+		memcpy(dir, rel, dl);
+		dir[dl] = '\0';
+	} else {
+		strcpy(dir, ".");
+	}
+	rootfd = open(handle->root, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if(rootfd < 0) {
+		return -2;
+	}
+	struct open_how how = {
+		.flags = O_PATH | O_DIRECTORY | O_CLOEXEC,
+		.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+	};
+	dirfd = (int)syscall(SYS_openat2, rootfd, dir, &how, sizeof(how));
+	if(dirfd < 0) {
+		int e = errno;
+		close(rootfd);
+		if(e == ELOOP || e == EXDEV) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename,
+					"a parent directory is a symlink");
+			return 1;
+		}
+		return -2; /* missing parents, old kernel: libarchive handles these */
+	}
+	for(int tries = 0; tries < 100 && fd < 0; tries++) {
+		snprintf(tmp, sizeof(tmp), ".btrpkg.%d.%u", (int)getpid(), counter++);
+		fd = openat(dirfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if(fd < 0 && errno != EEXIST) {
+			break;
+		}
+	}
+	if(fd < 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	struct file_clone_range cr = {
+		.src_fd = srcfd,
+		.src_offset = off,
+		.src_length = (size + 4095) & ~(uint64_t)4095,
+		.dest_offset = 0,
+	};
+	if(ioctl(fd, FICLONERANGE, &cr) != 0) {
+		/* not btrfs, another filesystem than the cache, or unaligned: copy */
+		loff_t so = (loff_t)off, done = 0;
+		while((uint64_t)done < size) {
+			ssize_t n = copy_file_range(srcfd, &so, fd, NULL, size - (uint64_t)done, 0);
+			if(n <= 0) {
+				_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename,
+						n < 0 ? strerror(errno) : "cache file too short");
+				goto out;
+			}
+			done += n;
+		}
+	}
+	if(ftruncate(fd, (off_t)size) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	if(geteuid() == 0 && fchown(fd, archive_entry_uid(entry), archive_entry_gid(entry)) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	if(fchmod(fd, archive_entry_perm(entry)) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	const char *xn;
+	const void *xv;
+	size_t xs;
+	archive_entry_xattr_reset(entry);
+	while(archive_entry_xattr_next(entry, &xn, &xv, &xs) == ARCHIVE_OK) {
+		if(fsetxattr(fd, xn, xv, xs, 0) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (xattr %s: %s)\n"), filename, xn, strerror(errno));
+			goto out;
+		}
+	}
+	struct timespec ts[2];
+	ts[0].tv_sec = ts[1].tv_sec = archive_entry_mtime(entry);
+	ts[0].tv_nsec = ts[1].tv_nsec = archive_entry_mtime_nsec(entry);
+	if(futimens(fd, ts) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	if(renameat(dirfd, tmp, dirfd, base) != 0) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("could not extract %s (%s)\n"), filename, strerror(errno));
+		goto out;
+	}
+	tmp[0] = '\0';
+	ret = 0;
+out:
+	if(fd >= 0) {
+		close(fd);
+		if(tmp[0]) {
+			unlinkat(dirfd, tmp, 0);
+		}
+	}
+	close(dirfd);
+	close(rootfd);
+	if(ret) {
+		alpm_logaction(handle, ALPM_CALLER_PREFIX, "error: could not extract %s\n", filename);
+	}
+	return ret;
+}
+#endif /* HAVE_BTRPKG */
+
 int SYMEXPORT alpm_add_pkg(alpm_handle_t *handle, alpm_pkg_t *pkg)
 {
 	const char *pkgname, *pkgver;
@@ -121,6 +259,19 @@ static int perform_extraction(alpm_handle_t *handle, struct archive *archive,
 	                          ARCHIVE_EXTRACT_UNLINK |
 	                          ARCHIVE_EXTRACT_XATTR |
 	                          ARCHIVE_EXTRACT_SECURE_SYMLINKS;
+
+#ifdef HAVE_BTRPKG
+	{
+		int srcfd;
+		uint64_t off, size;
+		if(_alpm_btr_large_file(archive, archive_entry_pathname(entry), &srcfd, &off, &size)) {
+			int r = btr_extract(handle, entry, filename, srcfd, off, size);
+			if(r != -2) {
+				return r;
+			}
+		}
+	}
+#endif
 
 	archive_entry_set_pathname(entry, filename);
 

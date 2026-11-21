@@ -61,6 +61,10 @@
 #include "handle.h"
 #include "trans.h"
 #include "sandbox.h"
+#ifdef HAVE_BTRPKG
+#include "btrpkg.h"
+#include "btrstream.h"
+#endif
 
 #ifndef HAVE_STRSEP
 /** Extracts tokens from a string.
@@ -284,6 +288,18 @@ int _alpm_open_archive(alpm_handle_t *handle, const char *path,
 #ifdef HAVE_STRUCT_STAT_ST_BLKSIZE
 	if(buf->st_blksize > ALPM_BUFFER_SIZE) {
 		bufsize = buf->st_blksize;
+	}
+#endif
+
+#ifdef HAVE_BTRPKG
+	/* a btrpkg cache file reads as a tar archive made from its index (btrstream.c) */
+	if(S_ISREG(buf->st_mode) && _alpm_btr_is_cache_file(fd)) {
+		char err[BTR_ERRLEN];
+		if(_alpm_btr_archive_open(*archive, fd, (uint64_t)buf->st_size, err) != 0) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("could not open file %s: %s\n"), path, err);
+			goto error;
+		}
+		return fd;
 	}
 #endif
 

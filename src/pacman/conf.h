@@ -71,6 +71,7 @@ typedef struct __config_t {
 	char *gpgdir;
 	char *sysroot;
 	char *sandboxuser;
+	char *btrpkghelper;
 	alpm_list_t *hookdirs;
 	alpm_list_t *cachedirs;
 	alpm_list_t *architectures;

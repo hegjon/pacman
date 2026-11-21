@@ -144,6 +144,10 @@ struct _alpm_pkg_t {
 	int infolevel;
 	/* Bitfield from alpm_pkgvalidation_t */
 	int validation;
+
+	/* sync package downloaded as a btrpkg cache file (filename is NAME.pkg.btr) */
+	int btr;
+	unsigned char btr_id[32]; /* header ID from the database's btrpkg.id */
 };
 
 alpm_file_t *_alpm_file_copy(alpm_file_t *dest, const alpm_file_t *src);
