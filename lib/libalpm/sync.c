@@ -60,6 +60,7 @@
 #include "sandbox.h"
 #include "util-common.h"
 #include <pwd.h>
+#include <ftw.h>
 
 static const char *const btr_keydirs[] = { "/etc/btrpkg/keys", "/usr/share/btrpkg/keys", NULL };
 
@@ -551,6 +552,19 @@ static void btr_plan(alpm_handle_t *handle, const char *cachedir, alpm_list_t *t
 	}
 }
 
+/* Remove a download directory that only root used (no download user): nftw without following
+ * symlinks, not crossing mounts. */
+static int btr_rm_entry(const char *path, const struct stat *st, int type, struct FTW *ftw)
+{
+	(void)st; (void)ftw;
+	return (type == FTW_DP ? rmdir(path) : unlink(path)) == 0 ? 0 : -1;
+}
+
+static void btr_rmtree(const char *dir)
+{
+	nftw(dir, btr_rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT);
+}
+
 /* Download the btrpkg targets among `files` (removing them from it), per repository:
  *   1. fetch-ids --index-only, as the download user when pacman sandboxes downloads (also under
  *      Landlock: it writes only to CACHEDIR/download-btrpkg/): the indexes and signatures.
@@ -596,6 +610,34 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 		alpm_db_t *db = ((alpm_pkg_t *)mine->data)->origin_data.db;
 		const char **ex = NULL;
 		char **argv = NULL, **fetch = NULL;
+		if(!sandboxed) {
+			/* no download user (DisableSandbox, or pacstrap, which always disables it): one root
+			 * process fetches straight into the cache files, so the chunks aren't written twice
+			 * (download directory, then cache file). Servers in order: CacheServer, then
+			 * Server; each attempt is all or nothing, so a failed one leaves no cache file. */
+			int done = 0;
+			for(int pass = 0; pass < 2 && !done; pass++) {
+				for(alpm_list_t *s = pass ? db->servers : db->cache_servers; s && !done; s = s->next) {
+					const char *pull[] = { "--installed", handle->root, "pull-ids", "--progress",
+						s->data, cachedir, NULL };
+					argv = btr_argv(handle, pull, mine);
+					if(argv && btr_run(handle, argv, 0, 1, mine) == 0) {
+						done = 1;
+					} else {
+						_alpm_log(handle, ALPM_LOG_WARNING, _("btrpkg: %s failed, trying the next server\n"),
+								(const char *)s->data);
+					}
+					btr_argv_free(argv);
+					argv = NULL;
+				}
+			}
+			if(!done) {
+				_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg packages from %s\n"), db->treename);
+				ret = -1;
+			}
+			btr_rmtree(dir); /* indexes the size planning fetched */
+			goto next;
+		}
 		if(btr_fetch_indexes(handle, mine, dir, sandboxed) != 0) {
 			ret = -1;
 			goto next;
