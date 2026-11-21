@@ -33,3 +33,7 @@ libalpm_sources = files('''
   util.h util.c
   version.c
 '''.split())
+
+if have_btrpkg
+  libalpm_sources += files('btrpkg.h', 'btrpkg.c')
+endif

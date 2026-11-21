@@ -122,6 +122,11 @@ else
   error('unhandled crypto value @0@'.format(want_crypto))
 endif
 
+# btrpkg packages (lib/libalpm/btrpkg.c): Ed25519 through OpenSSL, zstd for the index sections
+libzstd = dependency('libzstd', static : get_option('buildstatic'), required : false)
+have_btrpkg = want_crypto == 'openssl' and libzstd.found()
+conf.set('HAVE_BTRPKG', have_btrpkg)
+
 libseccomp = dependency('libseccomp',
                         static : get_option('buildstatic'),
                         required : false)
@@ -333,6 +338,9 @@ libcommon = static_library(
   install : false)
 
 alpm_deps = [crypto_provider, libarchive, libcurl, libintl, libseccomp, gpgme]
+if have_btrpkg
+  alpm_deps += [libzstd]
+endif
 
 libalpm_a = static_library(
   'alpm_objlib',
@@ -466,6 +474,9 @@ TEST_ENV.set('PMTEST_SCRIPT_DIR', join_paths(meson.project_build_root(), 'script
 subdir('test/pacman')
 subdir('test/scripts')
 subdir('test/util')
+if have_btrpkg
+  subdir('test/btrpkg')
+endif
 
 message('\n    '.join([
   '@0@ @1@'.format(meson.project_name(), meson.project_version()),
@@ -498,6 +509,7 @@ message('\n    '.join([
   '  Build docs               : @0@'.format(build_doc),
   '  debug build              : @0@'.format(get_option('buildtype') == 'debug'),
   '  Use libcurl              : @0@'.format(conf.get('HAVE_LIBCURL')),
+  '  btrpkg packages          : @0@'.format(have_btrpkg),
   '  Use GPGME                : @0@'.format(conf.get('HAVE_LIBGPGME')),
   '  Use OpenSSL              : @0@'.format(conf.has('HAVE_LIBSSL') and
                                             conf.get('HAVE_LIBSSL') == 1),
