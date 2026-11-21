@@ -125,6 +125,15 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 			_alpm_log(handle, ALPM_LOG_WARNING, _("%s: unusable btrpkg data in the database\n"), spkg->name);
 			continue;
 		}
+		/* the package file is already in a cache directory (an offline mirror such as the
+		 * ISO's, or an earlier download): use it, never download it again as btrpkg */
+		char *have = _alpm_filecache_find(handle, spkg->filename);
+		if(have) {
+			_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s is in the cache as %s, not using btrpkg\n",
+					spkg->name, have);
+			free(have);
+			continue;
+		}
 		char *fn = malloc(len - 7 + 9);
 		if(!fn) {
 			continue;
