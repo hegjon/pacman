@@ -711,6 +711,36 @@ void _alpm_pkg_xdata_free(alpm_pkg_xdata_t *pd)
 	}
 }
 
+#define BTR_VALIDATION_XDATA "btrpkg-validation"
+
+int _alpm_pkg_set_btr_signer(alpm_pkg_t *pkg, const char *keypath)
+{
+	alpm_list_t *i = pkg->xdata;
+	while(i) {
+		alpm_list_t *next = i->next;
+		alpm_pkg_xdata_t *pd = i->data;
+		if(strcmp(pd->name, BTR_VALIDATION_XDATA) == 0) {
+			pkg->xdata = alpm_list_remove_item(pkg->xdata, i);
+			_alpm_pkg_xdata_free(pd);
+			free(i);
+		}
+		i = next;
+	}
+	if(keypath) {
+		const char *base = strrchr(keypath, '/');
+		size_t len;
+		alpm_pkg_xdata_t *pd;
+		base = base ? base + 1 : keypath;
+		len = strlen("signify:") + strlen(base) + 1;
+		CALLOC(pd, 1, sizeof(alpm_pkg_xdata_t), return -1);
+		STRDUP(pd->name, BTR_VALIDATION_XDATA, free(pd); return -1);
+		MALLOC(pd->value, len, _alpm_pkg_xdata_free(pd); return -1);
+		snprintf(pd->value, len, "signify:%s", base);
+		pkg->xdata = alpm_list_add(pkg->xdata, pd);
+	}
+	return 0;
+}
+
 void _alpm_pkg_free(alpm_pkg_t *pkg)
 {
 	if(pkg == NULL) {
@@ -718,6 +748,7 @@ void _alpm_pkg_free(alpm_pkg_t *pkg)
 	}
 
 	FREE(pkg->filename);
+	FREE(pkg->btr_signer);
 	FREE(pkg->base);
 	FREE(pkg->name);
 	FREE(pkg->version);

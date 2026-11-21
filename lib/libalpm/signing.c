@@ -34,6 +34,11 @@
 #include "log.h"
 #include "alpm.h"
 #include "handle.h"
+#ifdef HAVE_BTRPKG
+#include <fcntl.h>
+#include <unistd.h>
+#include "btrstream.h"
+#endif
 
 int SYMEXPORT alpm_decode_signature(const char *base64_data,
 		unsigned char **data, size_t *data_len)
@@ -978,6 +983,20 @@ int SYMEXPORT alpm_pkg_check_pgp_signature(alpm_pkg_t *pkg,
 	ASSERT(pkg != NULL, return -1);
 	ASSERT(siglist != NULL, RET_ERR(pkg->handle, ALPM_ERR_WRONG_ARGS, -1));
 	pkg->handle->pm_errno = ALPM_ERR_OK;
+#ifdef HAVE_BTRPKG
+	/* a btrpkg file has no OpenPGP signature: its .sig is signify (alpm_pkg_load checks that) */
+	if(pkg->origin == ALPM_PKG_FROM_FILE && !pkg->base64_sig) {
+		int fd = open(pkg->filename, O_RDONLY | O_CLOEXEC);
+		int btr = fd >= 0 && _alpm_btr_is_cache_file(fd);
+		if(fd >= 0) {
+			close(fd);
+		}
+		if(btr) {
+			memset(siglist, 0, sizeof(*siglist));
+			RET_ERR(pkg->handle, ALPM_ERR_SIG_MISSING, -1);
+		}
+	}
+#endif
 
 	return _alpm_gpgme_checksig(pkg->handle, pkg->filename,
 			pkg->base64_sig, siglist);

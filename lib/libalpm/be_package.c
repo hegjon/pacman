@@ -41,6 +41,10 @@
 #include "deps.h"
 #include "filelist.h"
 #include "util.h"
+#ifdef HAVE_BTRPKG
+#include "btrpkg.h"
+#include "btrstream.h"
+#endif
 
 struct package_changelog {
 	struct archive *archive;
@@ -678,6 +682,13 @@ alpm_pkg_t *_alpm_pkg_load_internal(alpm_handle_t *handle,
 	if(_alpm_pkg_check_meta(newpkg) != 0) {
 		goto pkg_invalid;
 	}
+#ifdef HAVE_BTRPKG
+	/* btrpkg-validation is libalpm's record of a signature check, not something a package
+	 * file can claim for itself */
+	if(_alpm_pkg_set_btr_signer(newpkg, NULL) != 0) {
+		goto error;
+	}
+#endif
 
 	_alpm_archive_read_free(archive);
 	close(fd);
@@ -722,6 +733,62 @@ static int read_sigfile(const char *sigpath, unsigned char **sig)
 	return st.st_size;
 }
 
+#ifdef HAVE_BTRPKG
+/* pacman -U (and -Qp) of a btrpkg cache file. Its signature is signify (NAME.pkg.btr.sig, as
+ * the server published it), checked as LocalFileSigLevel asks against the btrpkg keys, not
+ * handed to GPGME. With full (what -U loads), every chunk's data is checked against the
+ * index too: unlike a cache file pull-ids assembled, nothing else has looked at it. Returns 1
+ * when filename is not a btrpkg file, 0 when it passed, -1 with pm_errno set. */
+static int btr_load(alpm_handle_t *handle, const char *filename, int full, int level,
+		alpm_pkg_t **pkg)
+{
+	char err[BTR_ERRLEN], keypath[PATH_MAX];
+	struct stat st;
+	int fd = open(filename, O_RDONLY | O_CLOEXEC);
+	if(fd < 0) {
+		return 1; /* the usual path reports it */
+	}
+	if(fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || !_alpm_btr_is_cache_file(fd)) {
+		close(fd);
+		return 1;
+	}
+	if(_alpm_btr_validate(fd, NULL, (uint64_t)st.st_size, err) != 0
+			|| (full && _alpm_btr_check_data(fd, (uint64_t)st.st_size, err) != 0)) {
+		_alpm_log(handle, ALPM_LOG_ERROR, _("%s: %s\n"), filename, err);
+		close(fd);
+		RET_ERR(handle, ALPM_ERR_PKG_INVALID_CHECKSUM, -1);
+	}
+	int signed_by = 0;
+	if(level & ALPM_SIG_PACKAGE) {
+		int r = _alpm_btr_check_sig(fd, filename, keypath, err);
+		if(r == 1 && !(level & ALPM_SIG_PACKAGE_OPTIONAL)) {
+			close(fd);
+			RET_ERR(handle, ALPM_ERR_PKG_MISSING_SIG, -1);
+		}
+		if(r == -1) {
+			_alpm_log(handle, ALPM_LOG_ERROR, _("%s: btrpkg signature: %s\n"), filename, err);
+			close(fd);
+			RET_ERR(handle, ALPM_ERR_PKG_INVALID_SIG, -1);
+		}
+		signed_by = r == 0;
+	}
+	close(fd);
+	*pkg = _alpm_pkg_load_internal(handle, filename, full);
+	if(*pkg == NULL) {
+		return -1;
+	}
+	/* as for a .pkg.tar.* file without a signature: none, also when the data checked out
+	 * against an index nothing vouches for; a signature is recorded as extended data */
+	(*pkg)->validation = ALPM_PKG_VALIDATION_NONE;
+	if(signed_by && _alpm_pkg_set_btr_signer(*pkg, keypath) != 0) {
+		_alpm_pkg_free(*pkg);
+		*pkg = NULL;
+		RET_ERR(handle, ALPM_ERR_MEMORY, -1);
+	}
+	return 0;
+}
+#endif
+
 int SYMEXPORT alpm_pkg_load(alpm_handle_t *handle, const char *filename, int full,
 		int level, alpm_pkg_t **pkg)
 {
@@ -731,6 +798,14 @@ int SYMEXPORT alpm_pkg_load(alpm_handle_t *handle, const char *filename, int ful
 
 	CHECK_HANDLE(handle, return -1);
 	ASSERT(pkg != NULL, RET_ERR(handle, ALPM_ERR_WRONG_ARGS, -1));
+#ifdef HAVE_BTRPKG
+	{
+		int r = btr_load(handle, filename, full, level, pkg);
+		if(r != 1) {
+			return r;
+		}
+	}
+#endif
 
 	sigpath = _alpm_sigpath(handle, filename);
 	if(sigpath && !_alpm_access(handle, NULL, sigpath, R_OK)) {

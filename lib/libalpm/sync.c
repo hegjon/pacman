@@ -62,7 +62,6 @@
 #include <pwd.h>
 #include <ftw.h>
 
-static const char *const btr_keydirs[] = { "/etc/btrpkg/keys", "/usr/share/btrpkg/keys", NULL };
 
 static const char *btr_xdata(alpm_pkg_t *pkg, const char *name)
 {
@@ -668,7 +667,10 @@ next:
 
 /* The check of a btrpkg cache file that replaces the sha256sum and OpenPGP checks: the index
  * must parse and have the header ID the database gives, and with package signatures on, a
- * signify signature (NAME.pkg.btr.sig, from the server) by a key in btr_keydirs. */
+ * signify signature (NAME.pkg.btr.sig, from the server) by a key in _alpm_btr_keydirs. The
+ * ID check is recorded as sha256 (it is a SHA-256 over the header, which holds the hashes of
+ * everything else), the signature as btrpkg-validation extended data (pkg->btr_signer), not
+ * as pgp. */
 static int btr_validate(alpm_handle_t *handle, alpm_pkg_t *pkg, const char *path, int siglevel,
 		int *validation)
 {
@@ -689,33 +691,26 @@ static int btr_validate(alpm_handle_t *handle, alpm_pkg_t *pkg, const char *path
 		return -1;
 	}
 	*validation = ALPM_PKG_VALIDATION_SHA256SUM;
+	FREE(pkg->btr_signer);
 	if(siglevel & ALPM_SIG_PACKAGE) {
-		char sigpath[PATH_MAX], sig[4096], keypath[PATH_MAX];
-		unsigned char hdr[BTR_HDR];
-		ssize_t sl = -1;
-		snprintf(sigpath, sizeof(sigpath), "%s.sig", path);
-		int sfd = open(sigpath, O_RDONLY | O_CLOEXEC);
-		if(sfd >= 0) {
-			sl = read(sfd, sig, sizeof(sig));
-			close(sfd);
-		}
-		if(sl <= 0) {
-			close(fd);
+		char keypath[PATH_MAX];
+		int r = _alpm_btr_check_sig(fd, path, keypath, err);
+		close(fd);
+		if(r == 1) {
 			if(siglevel & ALPM_SIG_PACKAGE_OPTIONAL) {
 				return 0;
 			}
 			handle->pm_errno = ALPM_ERR_PKG_MISSING_SIG;
 			return -1;
 		}
-		if(pread(fd, hdr, BTR_HDR, 0) != BTR_HDR
-				|| btr_sig_verify(hdr, sig, (size_t)sl, btr_keydirs, keypath, err) != 0) {
+		if(r != 0) {
 			_alpm_log(handle, ALPM_LOG_ERROR, _("%s: btrpkg signature: %s\n"), pkg->name, err);
-			close(fd);
 			handle->pm_errno = ALPM_ERR_PKG_INVALID_CHECKSUM;
 			return -1;
 		}
 		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s signed by %s\n", pkg->name, keypath);
-		*validation |= ALPM_PKG_VALIDATION_SIGNATURE;
+		STRDUP(pkg->btr_signer, keypath, RET_ERR(handle, ALPM_ERR_MEMORY, -1));
+		return 0;
 	}
 	close(fd);
 	return 0;
@@ -1357,9 +1352,14 @@ int _alpm_sync_prepare(alpm_handle_t *handle, alpm_list_t **data)
 	}
 #ifdef HAVE_BTRPKG
 	/* decide now which targets come as btrpkg cache files, so their download size and cache
-	 * file names are right in what the frontend shows before the transaction */
-	btr_select(handle, _alpm_filecache_setup(handle));
-	btr_plan(handle, _alpm_filecache_setup(handle), trans->add);
+	 * file names are right in what the frontend shows before the transaction. Not for a
+	 * transaction that only shows what it would do (pacman -Sp sets NOLOCK): that stays the
+	 * stock view, the repository's file names and sizes, with no network I/O, as root or not.
+	 * If it is committed after all, _alpm_sync_load decides then. */
+	if(!(trans->flags & ALPM_TRANS_FLAG_NOLOCK)) {
+		btr_select(handle, _alpm_filecache_setup(handle));
+		btr_plan(handle, _alpm_filecache_setup(handle), trans->add);
+	}
 #endif
 	for(i = trans->add; i; i = i->next) {
 		/* update download size field */
@@ -1925,6 +1925,13 @@ static int load_packages(alpm_handle_t *handle, alpm_list_t **data,
 		pkgfile->reason = spkg->reason;
 		/* copy over validation method */
 		pkgfile->validation = spkg->validation;
+#ifdef HAVE_BTRPKG
+		/* the signature record, or (unsigned) none: never what the package's own .PKGINFO says */
+		if(spkg->btr && _alpm_pkg_set_btr_signer(pkgfile, spkg->btr_signer) != 0) {
+			_alpm_pkg_free(pkgfile);
+			RET_ERR(handle, ALPM_ERR_MEMORY, -1);
+		}
+#endif
 		/* transfer oldpkg */
 		pkgfile->oldpkg = spkg->oldpkg;
 		spkg->oldpkg = NULL;

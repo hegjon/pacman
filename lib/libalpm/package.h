@@ -150,9 +150,16 @@ struct _alpm_pkg_t {
 	unsigned char btr_id[32]; /* header ID from the database's btrpkg.id */
 	int btr_planned;          /* btr_need is known (pull-ids --plan) */
 	off_t btr_need;           /* bytes to download: missing chunks plus the index */
+	char *btr_signer;         /* the key that signed it (signify), when checked */
 };
 
 alpm_file_t *_alpm_file_copy(alpm_file_t *dest, const alpm_file_t *src);
+
+/* The local database's record of a btrpkg signature check: extended data
+ * btrpkg-validation=signify:KEYNAME (keypath's file name), never a %VALIDATION% token, which
+ * the stock pacman beside pacman-btrpkg would warn about on every read. keypath NULL: only
+ * remove any such entry (a package's .PKGINFO must not claim one). */
+int _alpm_pkg_set_btr_signer(alpm_pkg_t *pkg, const char *keypath);
 
 alpm_pkg_t *_alpm_pkg_new(void);
 int _alpm_pkg_dup(alpm_pkg_t *pkg, alpm_pkg_t **new_ptr);

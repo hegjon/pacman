@@ -23,6 +23,8 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -443,6 +445,87 @@ int _alpm_btr_validate(int fd, const unsigned char *expected_id, uint64_t file_s
 	}
 	btr_index_free(idx);
 	return 0;
+}
+
+const char *const _alpm_btr_keydirs[] = { "/etc/btrpkg/keys", "/usr/share/btrpkg/keys", NULL };
+
+int _alpm_btr_check_data(int fd, uint64_t file_size, char *err)
+{
+	btr_index_t *idx = read_index(fd, NULL, file_size, err);
+	if(!idx) {
+		return -1;
+	}
+	uint64_t base = btr_image_base(&idx->hdr);
+	unsigned char *buf = malloc(BTR_MAX_EXTENT);
+	int ret = 0;
+	if(!buf) {
+		snprintf(err, BTR_ERRLEN, "out of memory");
+		btr_index_free(idx);
+		return -1;
+	}
+	for(uint64_t i = 0; i < idx->hdr.nchunks && ret == 0; i++) {
+		const btr_chunk_t *c = &idx->chunks[i];
+		unsigned char h[32];
+		size_t got = 0;
+		if(c->unencoded_len > BTR_MAX_EXTENT) {
+			snprintf(err, BTR_ERRLEN, "chunk %llu: too large", (unsigned long long)i);
+			ret = -1;
+			break;
+		}
+		while(got < c->unencoded_len) {
+			ssize_t n = pread(fd, buf + got, c->unencoded_len - got, (off_t)(base + c->image_off + got));
+			if(n < 0 && errno == EINTR) {
+				continue;
+			}
+			if(n <= 0) {
+				snprintf(err, BTR_ERRLEN, "chunk %llu: %s", (unsigned long long)i,
+						n < 0 ? strerror(errno) : "short file");
+				ret = -1;
+				break;
+			}
+			got += (size_t)n;
+		}
+		if(ret == 0) {
+			btr_sha256(buf, c->unencoded_len, h);
+			if(memcmp(h, c->raw, 32) != 0) {
+				snprintf(err, BTR_ERRLEN, "chunk %llu: data does not match the index", (unsigned long long)i);
+				ret = -1;
+			}
+		}
+	}
+	free(buf);
+	btr_index_free(idx);
+	return ret;
+}
+
+int _alpm_btr_check_sig(int fd, const char *path, char *keypath, char *err)
+{
+	char sigpath[PATH_MAX], sig[4096];
+	unsigned char hdr[BTR_HDR];
+	ssize_t sl;
+	if(snprintf(sigpath, sizeof(sigpath), "%s.sig", path) >= (int)sizeof(sigpath)) {
+		snprintf(err, BTR_ERRLEN, "path too long");
+		return -1;
+	}
+	int sfd = open(sigpath, O_RDONLY | O_CLOEXEC);
+	if(sfd < 0) {
+		if(errno == ENOENT) {
+			return 1;
+		}
+		snprintf(err, BTR_ERRLEN, "opening the .sig: %s", strerror(errno));
+		return -1;
+	}
+	sl = read(sfd, sig, sizeof(sig));
+	close(sfd);
+	if(sl <= 0) {
+		snprintf(err, BTR_ERRLEN, "reading the .sig: %s", sl < 0 ? strerror(errno) : "empty");
+		return -1;
+	}
+	if(pread(fd, hdr, BTR_HDR, 0) != BTR_HDR) {
+		snprintf(err, BTR_ERRLEN, "truncated header");
+		return -1;
+	}
+	return btr_sig_verify(hdr, sig, (size_t)sl, _alpm_btr_keydirs, keypath, err) == 0 ? 0 : -1;
 }
 
 int _alpm_btr_archive_open(struct archive *a, int fd, uint64_t file_size, char *err)
