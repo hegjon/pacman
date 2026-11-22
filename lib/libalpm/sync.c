@@ -94,9 +94,6 @@ static int btr_unhex32(const char *s, unsigned char out[32])
 	return 0;
 }
 
-/* Sync targets whose database entry carries btrpkg data come as NAME.pkg.btr cache files,
- * when a helper is configured and the cache directory is on btrfs (their data is shared with
- * the installed files by reflink). Everything else is downloaded as usual. */
 /* Where a package's repository keeps its btrparts, relative to the repository's URL: the
  * database's btrpkg.parts (e.g. ../pkg, shared by the architecture directories), else
  * pkg inside it. */
@@ -121,6 +118,11 @@ static int btr_parts_ok(const char *p)
 	return 1;
 }
 
+/* Sync targets whose database entry carries btrpkg data come as NAME.pkg.btr cache files,
+ * when a helper is configured and the cache directory is on btrfs (their data is shared with
+ * the installed files by reflink). Everything else is downloaded as usual.
+ * btrpkg.index is NAME.btrpkg: the repository keeps the thin index next to the package file (a
+ * cache file without its data, with the same signature); the helper makes NAME.pkg.btr from it. */
 static void btr_select(alpm_handle_t *handle, const char *cachedir)
 {
 	struct statfs sf;
@@ -139,13 +141,12 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 		}
 		index = btr_xdata(spkg, "btrpkg.index");
 		id = btr_xdata(spkg, "btrpkg.id");
-		if(!index || !id || strncmp(index, "index/", 6) != 0) {
+		if(!index || !id) {
 			continue;
 		}
-		const char *name = index + 6;
-		size_t len = strlen(name);
-		if(len <= 7 || strcmp(name + len - 7, ".btridx") != 0 || name[0] == '.'
-				|| memchr(name, '/', len - 7) || btr_unhex32(id, spkg->btr_id) != 0
+		size_t len = strlen(index);
+		if(len <= 7 || strcmp(index + len - 7, ".btrpkg") != 0 || index[0] == '.'
+				|| strchr(index, '/') || btr_unhex32(id, spkg->btr_id) != 0
 				|| !btr_parts_ok(btr_parts(spkg))) {
 			_alpm_log(handle, ALPM_LOG_WARNING, _("%s: unusable btrpkg data in the database\n"), spkg->name);
 			continue;
@@ -159,11 +160,11 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 			free(have);
 			continue;
 		}
-		char *fn = malloc(len - 7 + 9);
+		char *fn = malloc(len - 7 + sizeof(".pkg.btr"));
 		if(!fn) {
 			continue;
 		}
-		memcpy(fn, name, len - 7);
+		memcpy(fn, index, len - 7);
 		strcpy(fn + len - 7, ".pkg.btr");
 		FREE(spkg->btr_plain);
 		spkg->btr_plain = spkg->filename;
@@ -190,13 +191,21 @@ static void btr_unselect(alpm_pkg_t *p)
 	compute_download_size(p);
 }
 
+/* The path of `p`'s index in a download directory: DIR/NAME.btrpkg, where p->filename is the
+ * cache file NAME.pkg.btr. 0 if it fits in `size` bytes (with room for ".sig"). */
+static int btr_dl_index(char *path, size_t size, const char *dir, alpm_pkg_t *p)
+{
+	size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
+	int n = snprintf(path, size, "%s/%.*s.btrpkg", dir, (int)fl, p->filename);
+	return n < 0 || (size_t)n >= size - 4 ? -1 : 0;
+}
+
 /* Whether fetch-ids put the (checked) index of `p` into DIR. */
 static int btr_have_index(const char *dir, alpm_pkg_t *p)
 {
 	char path[PATH_MAX];
 	struct stat st;
-	size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
-	if(snprintf(path, sizeof(path), "%s/index/%.*s.btridx", dir, (int)fl, p->filename) >= (int)sizeof(path)) {
+	if(btr_dl_index(path, sizeof(path), dir, p) != 0) {
 		return 0;
 	}
 	return lstat(path, &st) == 0 && S_ISREG(st.st_mode);
