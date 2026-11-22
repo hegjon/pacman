@@ -165,11 +165,66 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 		}
 		memcpy(fn, name, len - 7);
 		strcpy(fn + len - 7, ".pkg.btr");
-		FREE(spkg->filename);
+		FREE(spkg->btr_plain);
+		spkg->btr_plain = spkg->filename;
 		spkg->filename = fn;
 		spkg->btr = 1;
 		_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s comes as %s\n", spkg->name, fn);
 	}
+}
+
+static int compute_download_size(alpm_pkg_t *newpkg);
+
+/* Back to the package's own file (the database's %FILENAME%), downloaded and checked as usual
+ * (sha256sum, OpenPGP signature). */
+static void btr_unselect(alpm_pkg_t *p)
+{
+	if(!p->btr || !p->btr_plain) {
+		return;
+	}
+	FREE(p->filename);
+	p->filename = p->btr_plain;
+	p->btr_plain = NULL;
+	p->btr = 0;
+	p->btr_planned = 0;
+	compute_download_size(p);
+}
+
+/* Whether fetch-ids put the (checked) index of `p` into DIR. */
+static int btr_have_index(const char *dir, alpm_pkg_t *p)
+{
+	char path[PATH_MAX];
+	struct stat st;
+	size_t fl = strlen(p->filename) - 8; /* without .pkg.btr */
+	if(snprintf(path, sizeof(path), "%s/index/%.*s.btridx", dir, (int)fl, p->filename) >= (int)sizeof(path)) {
+		return 0;
+	}
+	return lstat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Packages of `*mine` that have to come as package files: those without an index in DIR (no
+ * server had one, e.g. a database older than what the servers keep), or all of them (`all`,
+ * after the btrpkg download failed). They leave `*mine` and go to `*plain` (if given). */
+static void btr_fall_back(alpm_handle_t *handle, alpm_list_t **mine, alpm_list_t **plain,
+		const char *dir, int all)
+{
+	alpm_list_t *keep = NULL;
+	for(alpm_list_t *i = *mine; i; i = i->next) {
+		alpm_pkg_t *p = i->data;
+		if(!all && btr_have_index(dir, p)) {
+			keep = alpm_list_add(keep, p);
+			continue;
+		}
+		if(!all) {
+			_alpm_log(handle, ALPM_LOG_WARNING, _("btrpkg: no server has the index of %s, downloading the package instead\n"), p->name);
+		}
+		btr_unselect(p);
+		if(plain) {
+			*plain = alpm_list_add(*plain, p);
+		}
+	}
+	alpm_list_free(*mine);
+	*mine = keep;
 }
 
 /* The helper's argv: BtrPkgHelper split into words, then `extra` (NULL-terminated), then the
@@ -459,6 +514,7 @@ static const char **btr_fetch_args(alpm_db_t *db, const char *parts, const char 
 		ex[k++] = "--progress";
 	} else {
 		ex[k++] = "--index-only";
+		ex[k++] = "--skip-missing"; /* btr_fall_back takes care of those */
 	}
 	if(sandboxed) {
 		ex[k++] = "--landlock";
@@ -536,6 +592,10 @@ static void btr_plan(alpm_handle_t *handle, const char *cachedir, alpm_list_t *t
 	while(btr) {
 		alpm_list_t *mine = btr_take_repo(&btr);
 		if(btr_fetch_indexes(handle, mine, dir, sandboxed) == 0) {
+			/* no index anywhere: the package file, sized and downloaded as usual */
+			btr_fall_back(handle, &mine, NULL, dir, 0);
+		}
+		if(mine) {
 			const char *plan[] = { "--installed", handle->root, "pull-ids", "--plan", dir, cachedir, NULL };
 			char **argv = btr_argv(handle, plan, mine);
 			int out[2];
@@ -605,7 +665,10 @@ static void btr_rmtree(const char *dir)
  *      are checked against their hashes on arrival, and again by pull-ids when it reads them.
  *   4. pull-ids writes NAME.pkg.btr with encoded writes and removes the download directory.
  * Root never writes into the download directory and never touches the network. After a failure
- * the directory stays, so the next run fetches only what is still missing. */
+ * the directory stays, so the next run fetches only what is still missing.
+ * Packages no server has an index for (step 1), and every package of a repository whose btrpkg
+ * download failed, go back to `files`: their package files come the usual way, from the same
+ * servers, checked by sha256sum and OpenPGP signature. Only a broken download directory fails. */
 static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t **files)
 {
 	alpm_list_t *btr = NULL, *rest = NULL;
@@ -638,6 +701,17 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 		alpm_db_t *db = ((alpm_pkg_t *)mine->data)->origin_data.db;
 		const char **ex = NULL;
 		char **argv = NULL, **fetch = NULL;
+		int failed = 0;
+		/* the indexes first (usually already there from btr_plan); packages no server has an
+		 * index for come as package files */
+		if(btr_fetch_indexes(handle, mine, dir, sandboxed) != 0) {
+			failed = 1;
+			goto next;
+		}
+		btr_fall_back(handle, &mine, files, dir, 0);
+		if(!mine) {
+			goto next;
+		}
 		if(!sandboxed) {
 			/* no download user (DisableSandbox, or pacstrap, which always disables it): one root
 			 * process fetches straight into the cache files, so the chunks aren't written twice
@@ -659,15 +733,8 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 					argv = NULL;
 				}
 			}
-			if(!done) {
-				_alpm_log(handle, ALPM_LOG_ERROR, _("failed retrieving btrpkg packages from %s\n"), db->treename);
-				ret = -1;
-			}
-			btr_rmtree(dir); /* indexes the size planning fetched */
-			goto next;
-		}
-		if(btr_fetch_indexes(handle, mine, dir, sandboxed) != 0) {
-			ret = -1;
+			failed = !done;
+			btr_rmtree(dir); /* the indexes */
 			goto next;
 		}
 		ex = btr_fetch_args(db, btr_parts(mine->data), dir, missing, sandboxed);
@@ -675,15 +742,16 @@ static int btr_download(alpm_handle_t *handle, const char *cachedir, alpm_list_t
 		const char *pull[] = { "--installed", handle->root, "pull-ids", "--consume",
 			"--fetch-via", missing, dir, cachedir, NULL };
 		argv = btr_argv(handle, pull, mine);
-		if(!fetch || !argv) {
-			ret = -1;
-			goto next;
-		}
-		if(btr_pull(handle, argv, fetch, sandboxed, mine) != 0) {
-			_alpm_log(handle, ALPM_LOG_ERROR, _("btrpkg: could not assemble the packages from %s\n"), db->treename);
-			ret = -1;
+		if(!fetch || !argv || btr_pull(handle, argv, fetch, sandboxed, mine) != 0) {
+			failed = 1;
 		}
 next:
+		if(failed && mine) {
+			/* every attempt is all or nothing, so no cache file is half written: the package
+			 * files instead, from the same servers, checked as usual */
+			_alpm_log(handle, ALPM_LOG_WARNING, _("btrpkg: could not get the packages from %s as btrpkg, downloading the package files instead\n"), db->treename);
+			btr_fall_back(handle, &mine, files, dir, 1);
+		}
 		unlink(missing);
 		btr_argv_free(argv);
 		btr_argv_free(fetch);

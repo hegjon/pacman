@@ -151,6 +151,7 @@ struct _alpm_pkg_t {
 	int btr_planned;          /* btr_need is known (pull-ids --plan) */
 	off_t btr_need;           /* bytes to download: missing chunks plus the index */
 	char *btr_signer;         /* the key that signed it (signify), when checked */
+	char *btr_plain;          /* the database's file name, to fall back to it (btr_unselect) */
 };
 
 alpm_file_t *_alpm_file_copy(alpm_file_t *dest, const alpm_file_t *src);

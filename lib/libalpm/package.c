@@ -749,6 +749,7 @@ void _alpm_pkg_free(alpm_pkg_t *pkg)
 
 	FREE(pkg->filename);
 	FREE(pkg->btr_signer);
+	FREE(pkg->btr_plain);
 	FREE(pkg->base);
 	FREE(pkg->name);
 	FREE(pkg->version);
