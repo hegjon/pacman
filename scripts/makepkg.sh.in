@@ -64,6 +64,7 @@ INSTALL=0
 LOGGING=0
 NEEDED=0
 NOARCHIVE=0
+BTRPKG=1
 NOBUILD=0
 NODEPS=0
 NOEXTRACT=0
@@ -881,6 +882,54 @@ run_split_packaging() {
 	pkgname=("${pkgname_backup[@]}")
 }
 
+# makebtrpkg: put the finished packages into the btrpkg repository directory BTRDEST (default
+# PKGDEST), the package file and its .sig reflinked there when BTRDEST is elsewhere.
+#  - BTRREPO unset: `btrpkg convert` writes NAME.btrpkg (signed with the signify secret key
+#    BTRPKG_KEY when set) and its btrparts into BTRDEST/BTRPARTS (default pkg).
+#  - BTRREPO set: the packages are added to BTRDEST/BTRREPO.db.tar.zst (repo-add), then
+#    `btrpkg repo-update` converts them, signs them with BTRPKG_KEY and writes their btrpkg fields.
+create_btrpkgs() {
+	local pkg pkgarch pkg_file name
+	local fullver=$(get_full_version)
+	local dest=${BTRDEST:-$PKGDEST} parts=${BTRPARTS:-pkg}
+	local files=()
+
+	for pkg in "${pkgname[@]}"; do
+		pkgarch=$(get_pkg_arch $pkg) || continue
+		files+=("$PKGDEST/${pkg}-${fullver}-${pkgarch}${PKGEXT}")
+	done
+	if check_option "debug" "y" && check_option "strip" "y"; then
+		pkg_file="$PKGDEST/${pkgbase}-@DEBUGSUFFIX@-${fullver}-$(get_pkg_arch)${PKGEXT}"
+		[[ -f $pkg_file ]] && files+=("$pkg_file")
+	fi
+
+	msg "$(gettext "Converting package(s) to btrpkg in %s...")" "$dest"
+	mkdir -p "$dest" || return 1
+	local placed=()
+	for pkg_file in "${files[@]}"; do
+		name=${pkg_file##*/}
+		if ! [[ $dest -ef $PKGDEST ]]; then
+			cp --reflink=auto -f -- "$pkg_file" "$dest/$name" || return 1
+			rm -f -- "$dest/$name.sig"
+			if [[ -f $pkg_file.sig ]]; then
+				cp --reflink=auto -f -- "$pkg_file.sig" "$dest/$name.sig" || return 1
+			fi
+		fi
+		placed+=("$dest/$name")
+	done
+
+	if [[ -n $BTRREPO ]]; then
+		msg2 "$(gettext "Adding to repository %s...")" "$BTRREPO"
+		repo-add -q "$dest/$BTRREPO.db.tar.zst" "${placed[@]}" || return 1
+		btrpkg repo-update --no-gpg ${BTRPKG_KEY:+--key "$BTRPKG_KEY"} --parts "$parts" "$dest" "$BTRREPO" >/dev/null || return 1
+		return 0
+	fi
+	for pkg_file in "${placed[@]}"; do
+		msg2 "$(gettext "Converting %s...")" "${pkg_file##*/}"
+		btrpkg convert ${BTRPKG_KEY:+--key "$BTRPKG_KEY"} --parts "$parts" "$pkg_file" "$dest" >/dev/null || return 1
+	done
+}
+
 usage() {
 	printf "makepkg (pacman) %s\n" "$makepkg_version"
 	echo
@@ -917,6 +966,7 @@ usage() {
 	printf -- "$(gettext "  --nocheck        Do not run the %s function in the %s")\n" "check()" "$BUILDSCRIPT"
 	printf -- "$(gettext "  --noprepare      Do not run the %s function in the %s")\n" "prepare()" "$BUILDSCRIPT"
 	printf -- "$(gettext "  --nosign         Do not create a signature for the package")\n"
+	printf -- "$(gettext "  --nobtrpkg       Do not convert the package to btrpkg")\n"
 	printf -- "$(gettext "  --packagelist    Only list package filepaths that would be produced")\n"
 	printf -- "$(gettext "  --printsrcinfo   Print the generated SRCINFO and exit")\n"
 	printf -- "$(gettext "  --sign           Sign the resulting package with %s")\n" "gpg"
@@ -964,7 +1014,7 @@ ARGLIST=("$@")
 OPT_SHORT="AcCdD:efFghiLmop:rRsSV"
 OPT_LONG=('allsource' 'check' 'clean' 'cleanbuild' 'config:' 'dir:' 'force' 'geninteg'
           'help' 'holdver' 'ignorearch' 'install' 'key:' 'log' 'noarchive' 'nobuild'
-          'nocolor' 'nocheck' 'nodeps' 'noextract' 'noprepare' 'nosign' 'packagelist'
+          'nocolor' 'nocheck' 'nodeps' 'noextract' 'noprepare' 'nosign' 'nobtrpkg' 'packagelist'
           'printsrcinfo' 'repackage' 'rmdeps' 'sign' 'skipchecksums' 'skipinteg'
           'skippgpcheck' 'source' 'syncdeps' 'verifysource' 'version')
 
@@ -1009,6 +1059,7 @@ while true; do
 		--noverify)       RUN_VERIFY='n' ;;
 		--noprepare)      RUN_PREPARE='n' ;;
 		--nosign)         SIGNPKG='n' ;;
+		--nobtrpkg)       BTRPKG=0 ;;
 		-o|--nobuild)     BUILDPKG=0 NOBUILD=1 ;;
 		-p)               shift; BUILDFILE=$1 ;;
 		--packagelist)    BUILDPKG=0 PACKAGELIST=1;;
@@ -1268,6 +1319,14 @@ fi
 
 # check we have the software required to process the PKGBUILD
 check_software || exit $E_MISSING_MAKEPKG_DEPS
+if (( BTRPKG && ! NOARCHIVE )) && ! type -p btrpkg >/dev/null; then
+	error "$(gettext "Cannot find the %s binary needed to convert packages (or use %s).")" "btrpkg" "--nobtrpkg"
+	exit $E_MISSING_MAKEPKG_DEPS
+fi
+if (( BTRPKG && ! NOARCHIVE )) && [[ -n $BTRREPO ]] && ! type -p repo-add >/dev/null; then
+	error "$(gettext "Cannot find the %s binary required for %s.")" "repo-add" "BTRREPO"
+	exit $E_MISSING_MAKEPKG_DEPS
+fi
 
 # check if gpg signature is to be created and if signing key is valid
 if { [[ -z $SIGNPKG ]] && check_buildenv "sign" "y"; } || [[ $SIGNPKG == 'y' ]]; then
@@ -1414,6 +1473,10 @@ else
 	enter_fakeroot
 
 	create_package_signatures || exit $E_PRETTY_BAD_PRIVACY
+
+	if (( BTRPKG && ! NOARCHIVE )); then
+		create_btrpkgs || exit $E_PACKAGE_FAILED
+	fi
 fi
 
 # if inhibiting archive creation, go no further
