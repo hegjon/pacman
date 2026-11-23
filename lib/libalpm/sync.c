@@ -136,7 +136,7 @@ static void btr_select(alpm_handle_t *handle, const char *cachedir)
 	for(alpm_list_t *i = handle->trans->add; i; i = i->next) {
 		alpm_pkg_t *spkg = i->data;
 		const char *index, *id;
-		if(spkg->origin == ALPM_PKG_FROM_FILE || spkg->btr) {
+		if(spkg->origin == ALPM_PKG_FROM_FILE || spkg->btr || spkg->btr_declined) {
 			continue;
 		}
 		index = btr_xdata(spkg, "btrpkg.index");
@@ -646,8 +646,28 @@ static void btr_plan(alpm_handle_t *handle, const char *cachedir, alpm_list_t *t
 			}
 			btr_argv_free(argv);
 		}
+		/* already-compressed contents (kernel modules as .ko.zst) can make the btrparts bigger
+		 * than the package file: then the package file, unless local data makes up the difference */
+		for(alpm_list_t *i = mine; i; i = i->next) {
+			alpm_pkg_t *p = i->data;
+			char path[PATH_MAX];
+			if(!p->btr_planned || p->btr_need <= p->size) {
+				continue;
+			}
+			_alpm_log(handle, ALPM_LOG_DEBUG, "btrpkg: %s would download %jd bytes as btrpkg, %jd as %s: using the package file\n",
+					p->name, (intmax_t)p->btr_need, (intmax_t)p->size, p->btr_plain);
+			/* its index isn't needed any more: no leftover in the download directory */
+			if(btr_dl_index(path, sizeof(path), dir, p) == 0) {
+				unlink(path);
+				strcat(path, ".sig");
+				unlink(path);
+			}
+			p->btr_declined = 1;
+			btr_unselect(p);
+		}
 		alpm_list_free(mine);
 	}
+	rmdir(dir); /* only if every target went back to its package file */
 }
 
 /* Remove a download directory that only root used (no download user): nftw without following
